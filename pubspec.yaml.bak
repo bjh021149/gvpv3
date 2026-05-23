@@ -1,0 +1,94 @@
+name: emby_client
+description: A cross-platform Emby media client built with Flutter
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.6.0 <4.0.0'
+  flutter: '>=3.27.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+
+  # State Management
+  flutter_riverpod: ^2.6.1
+  riverpod_annotation: ^2.6.1
+
+  # Video Playback
+  media_kit: ^1.1.21
+  media_kit_video: ^1.1.21
+  media_kit_libs_video: ^1.1.21
+
+  # Image Caching
+  cached_network_image: ^3.4.1
+
+  # Routing
+  go_router: ^14.8.1
+
+  # HTTP
+  dio: ^5.8.0
+
+  # JSON Serialization
+  json_annotation: ^4.9.0
+  freezed_annotation: ^2.4.4
+
+  # Theme
+  flex_color_scheme: ^8.0.2
+
+  # Color extraction
+  palette_generator: ^0.3.3+5
+
+  # Responsive
+
+  # Local Storage
+  shared_preferences: ^2.5.0
+  flutter_secure_storage: ^9.2.4
+  hive_ce: ^2.10.1
+  hive_ce_flutter: ^2.2.0
+
+  # UI Utilities
+  skeletonizer: ^1.4.3
+  shimmer: ^3.0.0
+
+  # Navigation & Scrolling
+  scrollable_positioned_list: ^0.3.8
+
+  # Utilities
+  uuid: ^4.5.1
+  crypto: ^3.0.6
+  path_provider: ^2.1.5
+  intl: ^0.19.0
+  equatable: ^2.0.7
+  collection: ^1.19.0
+
+  # Window Management (Desktop)
+  window_manager: ^0.4.3
+
+  # Deep linking
+  app_links: ^6.4.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+  # Code Generation
+  build_runner: ^2.4.15
+  riverpod_generator: ^2.6.5
+  freezed: ^2.5.7
+  json_serializable: ^6.9.0
+  go_router_builder: ^2.8.0
+  hive_ce_generator: ^2.1.1
+  custom_lint: ^0.7.0
+  riverpod_lint: ^2.6.5
+
+flutter:
+  uses-material-design: true
+
+  # Assets (uncomment when assets are added)
+  # assets:
+  #   - assets/images/
+  #   - assets/icons/

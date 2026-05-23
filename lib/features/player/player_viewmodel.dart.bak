@@ -1,0 +1,501 @@
+import 'dart:async';
+
+import 'package:emby_client/core/api/dio_client.dart';
+import 'package:emby_client/core/api/emby_api_service.dart';
+import 'package:emby_client/core/models/base_item_dto.dart';
+import 'package:emby_client/core/models/media_source_info.dart';
+import 'package:emby_client/core/models/media_stream.dart';
+import 'package:emby_client/features/player/fvp_player_provider.dart';
+import 'package:emby_client/services/repositories/auth_repository_impl.dart';
+import 'package:emby_client/services/repositories/media_repository_impl.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:fvp/mdk.dart';
+
+/// Provider for the player view model, keyed by item ID.
+final playerViewModelProvider =
+    AsyncNotifierProvider.family<PlayerViewModel, PlayerState, String>(
+  PlayerViewModel.new,
+);
+
+/// Immutable state representing the current player configuration and playback status.
+class PlayerState {
+  final bool isPlaying;
+  final bool isLoading;
+  final Duration position;
+  final Duration duration;
+  final double volume;
+  final double speed;
+  final List<MediaStream> videoTracks;
+  final List<MediaStream> audioTracks;
+  final List<MediaStream> subtitleTracks;
+  final int selectedVideoIndex;
+  final int selectedAudioIndex;
+  final int selectedSubtitleIndex;
+  final List<MediaSourceInfo> mediaSources;
+  final String? selectedMediaSourceId;
+  final String? error;
+  final bool isControlsVisible;
+  final bool isBuffering;
+  final BaseItemDto? item;
+  final MediaSourceInfo? currentSource;
+
+  const PlayerState({
+    this.isPlaying = false,
+    this.isLoading = true,
+    this.position = Duration.zero,
+    this.duration = Duration.zero,
+    this.volume = 1.0,
+    this.speed = 1.0,
+    this.videoTracks = const [],
+    this.audioTracks = const [],
+    this.subtitleTracks = const [],
+    this.selectedVideoIndex = 0,
+    this.selectedAudioIndex = 0,
+    this.selectedSubtitleIndex = -1,
+    this.mediaSources = const [],
+    this.selectedMediaSourceId,
+    this.error,
+    this.isControlsVisible = true,
+    this.isBuffering = false,
+    this.item,
+    this.currentSource,
+  });
+
+  /// Creates a copy of this state with selectively updated fields.
+  PlayerState copyWith({
+    bool? isPlaying,
+    bool? isLoading,
+    Duration? position,
+    Duration? duration,
+    double? volume,
+    double? speed,
+    List<MediaStream>? videoTracks,
+    List<MediaStream>? audioTracks,
+    List<MediaStream>? subtitleTracks,
+    int? selectedVideoIndex,
+    int? selectedAudioIndex,
+    int? selectedSubtitleIndex,
+    List<MediaSourceInfo>? mediaSources,
+    String? selectedMediaSourceId,
+    String? error,
+    bool? isControlsVisible,
+    bool? isBuffering,
+    BaseItemDto? item,
+    MediaSourceInfo? currentSource,
+  }) {
+    return PlayerState(
+      isPlaying: isPlaying ?? this.isPlaying,
+      isLoading: isLoading ?? this.isLoading,
+      position: position ?? this.position,
+      duration: duration ?? this.duration,
+      volume: volume ?? this.volume,
+      speed: speed ?? this.speed,
+      videoTracks: videoTracks ?? this.videoTracks,
+      audioTracks: audioTracks ?? this.audioTracks,
+      subtitleTracks: subtitleTracks ?? this.subtitleTracks,
+      selectedVideoIndex: selectedVideoIndex ?? this.selectedVideoIndex,
+      selectedAudioIndex: selectedAudioIndex ?? this.selectedAudioIndex,
+      selectedSubtitleIndex: selectedSubtitleIndex ?? this.selectedSubtitleIndex,
+      mediaSources: mediaSources ?? this.mediaSources,
+      selectedMediaSourceId: selectedMediaSourceId ?? this.selectedMediaSourceId,
+      error: error,
+      isControlsVisible: isControlsVisible ?? this.isControlsVisible,
+      isBuffering: isBuffering ?? this.isBuffering,
+      item: item ?? this.item,
+      currentSource: currentSource ?? this.currentSource,
+    );
+  }
+}
+
+/// ViewModel that manages media playback using fvp and provides
+/// reactive [PlayerState] via Riverpod.
+class PlayerViewModel extends AsyncNotifier<PlayerState> {
+  /// The item ID passed as the family argument.
+  final String itemId;
+
+  PlayerViewModel(this.itemId);
+
+  Timer? _controlsHideTimer;
+  Timer? _positionTimer;
+  Timer? _bufferTimer;
+
+  /// The underlying fvp [Player] instance (global singleton).
+  Player get _player => ref.read(fvpPlayerProvider);
+
+  @override
+  Future<PlayerState> build() async {
+    // Ensure disposal when the provider is destroyed.
+    ref.onDispose(() {
+      _cancelControlsTimer();
+      _stopTimers();
+      // Pause but do NOT dispose — Player is reused globally.
+      try {
+        _player.state = PlaybackState.paused;
+      } catch (_) {
+        // ignore
+      }
+    });
+
+    try {
+      final mediaRepo = ref.read(mediaRepositoryProvider);
+      debugPrint('[Player] Fetching playback info for itemId=$itemId');
+      final playbackInfo = await mediaRepo.getPlaybackInfo(itemId);
+      debugPrint('[Player] PlaybackInfo mediaSources count=${playbackInfo.mediaSources.length}');
+      final item = await mediaRepo.getItemDetail(itemId);
+
+      final sources = playbackInfo.mediaSources;
+      if (sources.isEmpty) {
+        debugPrint('[Player] No media sources available');
+        return PlayerState(
+          isLoading: false,
+          error: 'No media sources available',
+          item: item,
+        );
+      }
+
+      // Prefer direct stream; fall back to the first available source.
+      final source = sources.firstWhere(
+        (s) => s.supportsDirectStream == true,
+        orElse: () => sources.first,
+      );
+      debugPrint('[Player] Selected source: id=${source.id}, protocol=${source.protocol}');
+
+      final allStreams = source.mediaStreams;
+      final videoTracks =
+          allStreams.where((s) => s.type == 'Video').toList();
+      final audioTracks =
+          allStreams.where((s) => s.type == 'Audio').toList();
+      final subtitleTracks =
+          allStreams.where((s) => s.type == 'Subtitle').toList();
+
+      debugPrint('[Player] videoTracks count=${videoTracks.length}, indexes=${videoTracks.map((v) => v.index).toList()}');
+      debugPrint('[Player] audioTracks count=${audioTracks.length}, indexes=${audioTracks.map((a) => a.index).toList()}');
+      debugPrint('[Player] subtitleTracks count=${subtitleTracks.length}, indexes=${subtitleTracks.map((s) => s.index).toList()}');
+      for (final s in allStreams) {
+        debugPrint('[Player] stream: index=${s.index}, type=${s.type}, codec=${s.codec}, lang=${s.language}, title=${s.title}, displayTitle=${s.displayTitle}');
+      }
+
+      // Build Emby streaming URL
+      final serverUrl = ref.read(embyBaseUrlProvider);
+      final token = await ref.read(authRepositoryProvider).getAccessToken();
+      final streamId = source.id ?? itemId;
+      final directUrl =
+          '$serverUrl/Videos/$streamId/stream'
+          '?Static=true'
+          '&api_key=$token';
+      debugPrint('[Player] directUrl=$directUrl');
+
+      // --- fvp playback flow ---
+      final player = _player;
+      player.media = directUrl;
+      player.volume = 1.0;
+      player.playbackRate = 1.0;
+      player.setBufferRange(min: 10000, max: 500000, drop: false);
+
+      // Prepare from beginning (resume position can be added later)
+      final result = await player.prepare(position: 0);
+      debugPrint('[Player] prepare result: $result');
+
+      if (result == -10) {
+        return PlayerState(
+          isLoading: false,
+          error: '视频准备失败 (code $result)',
+          item: item,
+        );
+      }
+
+      await player.updateTexture();
+      player.state = PlaybackState.playing;
+      debugPrint('[Player] Playback started');
+
+      _attachPlayerListeners();
+
+      return PlayerState(
+        isLoading: false,
+        videoTracks: videoTracks,
+        audioTracks: audioTracks,
+        subtitleTracks: subtitleTracks,
+        mediaSources: sources,
+        selectedMediaSourceId: source.id,
+        item: item,
+        currentSource: source,
+      );
+    } catch (e) {
+      return PlayerState(
+        isLoading: false,
+        error: e.toString(),
+      );
+    }
+  }
+
+  /// Attach fvp player event listeners and start polling timers.
+  void _attachPlayerListeners() {
+    final player = _player;
+
+    // Listen for state changes (playing/paused/stopped)
+    player.onStateChanged.listen((event) {
+      _updateState((s) => s.copyWith(
+        isPlaying: event.newValue == PlaybackState.playing,
+      ));
+    });
+
+    // Listen for media status changes (loaded/invalid/buffering)
+    player.onMediaStatus.listen((event) {
+      final isBuffering = event.newValue.test(MediaStatus.buffering);
+      _updateState((s) => s.copyWith(isBuffering: isBuffering));
+    });
+
+    // Poll position every 500ms (fvp has no position stream)
+    _positionTimer = Timer.periodic(const Duration(milliseconds: 500), (_) {
+      try {
+        final posMs = player.position;
+        final durMs = player.mediaInfo.duration;
+        _updateState((s) => s.copyWith(
+          position: Duration(milliseconds: posMs),
+          duration: Duration(milliseconds: durMs),
+        ));
+      } catch (_) {
+        // ignore
+      }
+    });
+
+    // Poll buffering state every 1s
+    _bufferTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      try {
+        final buffered = player.buffered();
+        // fvp buffered() returns milliseconds ahead of current position
+        _updateState((s) => s.copyWith(
+          isBuffering: buffered <= 0,
+        ));
+      } catch (_) {
+        // ignore
+      }
+    });
+  }
+
+  void _stopTimers() {
+    _positionTimer?.cancel();
+    _positionTimer = null;
+    _bufferTimer?.cancel();
+    _bufferTimer = null;
+  }
+
+  /// Toggle between play and pause.
+  void playPause() {
+    try {
+      final player = _player;
+      if (player.state == PlaybackState.playing) {
+        player.state = PlaybackState.paused;
+      } else {
+        player.state = PlaybackState.playing;
+      }
+    } catch (_) {
+      // Player not ready; ignore.
+    }
+  }
+
+  /// Seek to the specified position.
+  void seek(Duration position) {
+    try {
+      _player.seek(position: position.inMilliseconds);
+    } catch (_) {
+      // Player not ready; ignore.
+    }
+  }
+
+  /// Set the player volume in the range [0.0, 1.0].
+  void setVolume(double volume) {
+    try {
+      final clamped = volume.clamp(0.0, 1.0);
+      _player.volume = clamped;
+      _updateState((s) => s.copyWith(volume: clamped));
+    } catch (_) {
+      // Player not ready; ignore.
+    }
+  }
+
+  /// Switch to a different media source and reload the player.
+  Future<void> switchMediaSource(String sourceId) async {
+    final current = state.value;
+    if (current == null) return;
+    if (sourceId == current.selectedMediaSourceId) return;
+
+    final source = current.mediaSources.firstWhere(
+      (s) => s.id == sourceId,
+      orElse: () => current.currentSource!,
+    );
+
+    try {
+      // Save current position for resume
+      final resumePos = _player.position;
+
+      // Build new streaming URL
+      final serverUrl = ref.read(embyBaseUrlProvider);
+      final token = await ref.read(authRepositoryProvider).getAccessToken();
+      final streamId = source.id ?? itemId;
+      final directUrl =
+          '$serverUrl/Videos/$streamId/stream'
+          '?Static=true'
+          '&api_key=$token';
+
+      // Switch source
+      _player.media = directUrl;
+      final result = await _player.prepare(position: resumePos);
+      if (result == -10) {
+        _updateState((s) => s.copyWith(
+          error: '切换源失败 (code $result)',
+        ));
+        return;
+      }
+      await _player.updateTexture();
+      _player.state = PlaybackState.playing;
+
+      // Update streams
+      final allStreams = source.mediaStreams;
+      final videoTracks = allStreams.where((s) => s.type == 'Video').toList();
+      final audioTracks = allStreams.where((s) => s.type == 'Audio').toList();
+      final subtitleTracks = allStreams.where((s) => s.type == 'Subtitle').toList();
+
+      _updateState((s) => s.copyWith(
+        selectedMediaSourceId: sourceId,
+        currentSource: source,
+        videoTracks: videoTracks,
+        audioTracks: audioTracks,
+        subtitleTracks: subtitleTracks,
+        selectedVideoIndex: 0,
+        selectedAudioIndex: 0,
+        selectedSubtitleIndex: -1,
+      ));
+    } catch (e) {
+      _updateState((s) => s.copyWith(error: '切换源失败: $e'));
+    }
+  }
+
+  /// Select a video track by its index in [videoTracks].
+  void selectVideoTrack(int index) {
+    final current = state.value;
+    if (current == null) return;
+    if (index < 0 || index >= current.videoTracks.length) return;
+
+    try {
+      _player.activeVideoTracks = [index];
+      _updateState((s) => s.copyWith(selectedVideoIndex: index));
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  /// Select an audio track by its index in [audioTracks].
+  /// NOTE: fvp uses track index (0-based). Actual switching with Direct Stream
+  /// requires refetching PlaybackInfo with AudioStreamIndex.
+  void selectAudioTrack(int index) {
+    final current = state.value;
+    if (current == null) return;
+    if (index < 0 || index >= current.audioTracks.length) return;
+
+    try {
+      _player.activeAudioTracks = [index];
+      _updateState((s) => s.copyWith(selectedAudioIndex: index));
+    } catch (_) {
+      // ignore
+    }
+
+    _reportStreamSelection(audioStreamIndex: current.audioTracks[index].index);
+  }
+
+  /// Select a subtitle track by its index in [subtitleTracks].
+  /// Pass `-1` to disable subtitles.
+  void selectSubtitleTrack(int index) {
+    final current = state.value;
+    if (current == null) return;
+    if (index < -1 || index >= current.subtitleTracks.length) return;
+
+    if (index == -1) {
+      try {
+        _player.activeSubtitleTracks = [];
+      } catch (_) {}
+      _reportStreamSelection(subtitleStreamIndex: -1);
+      _updateState((s) => s.copyWith(selectedSubtitleIndex: -1));
+      return;
+    }
+
+    final track = current.subtitleTracks[index];
+    try {
+      _player.activeSubtitleTracks = [index];
+    } catch (_) {}
+
+    _reportStreamSelection(subtitleStreamIndex: track.index);
+    _updateState((s) => s.copyWith(selectedSubtitleIndex: index));
+  }
+
+  /// Report current stream selection to the Emby server.
+  void _reportStreamSelection({
+    int? audioStreamIndex,
+    int? subtitleStreamIndex,
+  }) {
+    final current = state.value;
+    if (current == null || current.currentSource == null) return;
+
+    try {
+      final api = ref.read(embyApiServiceProvider);
+      final positionTicks = current.position.inMicroseconds * 10;
+
+      api.reportPlaybackProgress(
+        itemId,
+        current.currentSource!.id!,
+        positionTicks: positionTicks,
+        audioStreamIndex: audioStreamIndex,
+        subtitleStreamIndex: subtitleStreamIndex,
+      ).catchError((e) {
+        debugPrint('[Player] Failed to report stream selection: $e');
+        return false;
+      });
+    } catch (e) {
+      debugPrint('[Player] Failed to report stream selection: $e');
+    }
+  }
+
+  /// Toggle the visibility of the player controls overlay.
+  void toggleControls() {
+    final current = state.value;
+    if (current == null) return;
+
+    final willShow = !current.isControlsVisible;
+    _updateState((s) => s.copyWith(isControlsVisible: willShow));
+
+    if (willShow) {
+      _startControlsHideTimer();
+    } else {
+      _cancelControlsTimer();
+    }
+  }
+
+  /// Show controls and restart the auto-hide timer.
+  void showControlsTemporarily() {
+    _updateState((s) => s.copyWith(isControlsVisible: true));
+    _startControlsHideTimer();
+  }
+
+  void _startControlsHideTimer() {
+    _cancelControlsTimer();
+    _controlsHideTimer = Timer(const Duration(seconds: 3), () {
+      final current = state.value;
+      if (current != null && current.isPlaying) {
+        _updateState((s) => s.copyWith(isControlsVisible: false));
+      }
+    });
+  }
+
+  void _cancelControlsTimer() {
+    _controlsHideTimer?.cancel();
+    _controlsHideTimer = null;
+  }
+
+  void _updateState(PlayerState Function(PlayerState) updater) {
+    final current = state.value;
+    if (current != null) {
+      state = AsyncValue.data(updater(current));
+    }
+  }
+}

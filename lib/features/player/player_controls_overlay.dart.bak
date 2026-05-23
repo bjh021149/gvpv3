@@ -1,0 +1,730 @@
+import 'package:emby_client/features/player/player_viewmodel.dart';
+import 'package:emby_client/features/player/progress_slider.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+
+/// Full-screen overlay that renders the player control bar on top of the video.
+///
+/// Uses [AnimatedOpacity] to fade in/out based on [PlayerState.isControlsVisible].
+class PlayerControlsOverlay extends ConsumerWidget {
+  final String itemId;
+
+  const PlayerControlsOverlay({
+    super.key,
+    required this.itemId,
+  });
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final stateAsync = ref.watch(playerViewModelProvider(itemId));
+
+    return stateAsync.when(
+      data: (state) => _buildOverlay(context, ref, state),
+      loading: () => _buildLoadingOverlay(context),
+      error: (err, _) => _buildErrorOverlay(context, err),
+    );
+  }
+
+  Widget _buildOverlay(BuildContext context, WidgetRef ref, PlayerState state) {
+    final viewModel = ref.read(playerViewModelProvider(itemId).notifier);
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    final itemName = state.item?.name ?? 'Playing';
+
+    return AnimatedOpacity(
+      opacity: state.isControlsVisible ? 1.0 : 0.0,
+      duration: const Duration(milliseconds: 250),
+      curve: Curves.easeInOut,
+      child: AbsorbPointer(
+        absorbing: !state.isControlsVisible,
+        child: Container(
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+              colors: [
+                Colors.black.withValues(alpha: 0.7),
+                Colors.transparent,
+                Colors.transparent,
+                Colors.black.withValues(alpha: 0.7),
+              ],
+              stops: const [0.0, 0.2, 0.7, 1.0],
+            ),
+          ),
+          child: SafeArea(
+            child: Column(
+              children: [
+                // ---- Top bar ----
+                _TopBar(
+                  title: itemName,
+                  onBack: () {
+                    final router = GoRouter.of(context);
+                    if (router.canPop()) {
+                      context.pop();
+                    } else {
+                      context.goNamed('detail', pathParameters: {'id': itemId});
+                    }
+                  },
+                  onHome: () => context.goNamed('home'),
+                  onSettings: () => _showSettingsMenu(context, ref, state),
+                ),
+
+                const Spacer(),
+
+                // ---- Center seek buttons ----
+                _CenterSeekControls(
+                  onSeekBackward: () {
+                    final target = state.position - const Duration(seconds: 10);
+                    viewModel.seek(target.clamp(Duration.zero, state.duration));
+                    HapticFeedback.lightImpact();
+                  },
+                  onSeekForward: () {
+                    final target = state.position + const Duration(seconds: 10);
+                    viewModel.seek(target.clamp(Duration.zero, state.duration));
+                    HapticFeedback.lightImpact();
+                  },
+                ),
+
+                const Spacer(),
+
+                // ---- Bottom bar ----
+                _BottomBar(
+                  state: state,
+                  viewModel: viewModel,
+                  colorScheme: colorScheme,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildLoadingOverlay(BuildContext context) {
+    return const Center(
+      child: CircularProgressIndicator(
+        strokeWidth: 2,
+      ),
+    );
+  }
+
+  Widget _buildErrorOverlay(BuildContext context, Object? error) {
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(
+            Icons.error_outline,
+            color: Colors.white70,
+            size: 48,
+          ),
+          const SizedBox(height: 12),
+          Text(
+            'Playback Error',
+            style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                  color: Colors.white,
+                ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            error?.toString() ?? 'Unknown error',
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: Colors.white70,
+                ),
+            textAlign: TextAlign.center,
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showSettingsMenu(
+    BuildContext context,
+    WidgetRef ref,
+    PlayerState state,
+  ) {
+    final viewModel = ref.read(playerViewModelProvider(itemId).notifier);
+
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: Colors.black.withValues(alpha: 0.9),
+      barrierColor: Colors.transparent,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (ctx) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // Handle bar.
+                Container(
+                  width: 40,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.3),
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                // Speed selection.
+                _buildSpeedTile(context, viewModel, state),
+                // Unified track selection (audio + subtitle).
+                if (state.audioTracks.isNotEmpty || state.subtitleTracks.isNotEmpty)
+                  _buildTracksTile(context, viewModel, state),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildSpeedTile(
+    BuildContext context,
+    PlayerViewModel viewModel,
+    PlayerState state,
+  ) {
+    final speeds = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+    return ListTile(
+      leading: const Icon(Icons.speed, color: Colors.white70),
+      title: const Text(
+        'Playback Speed',
+        style: TextStyle(color: Colors.white),
+      ),
+      subtitle: Text(
+        '${state.speed}x',
+        style: TextStyle(color: Colors.white.withValues(alpha: 0.6)),
+      ),
+      trailing: PopupMenuButton<double>(
+        initialValue: state.speed,
+        color: Colors.grey.shade900,
+        onSelected: viewModel.setSpeed,
+        itemBuilder: (_) => speeds
+            .map(
+              (s) => PopupMenuItem(
+                value: s,
+                child: Text(
+                  '${s}x',
+                  style: TextStyle(
+                    color: s == state.speed ? Colors.blue : Colors.white,
+                  ),
+                ),
+              ),
+            )
+            .toList(),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              '${state.speed}x',
+              style: const TextStyle(color: Colors.white70),
+            ),
+            const Icon(Icons.arrow_drop_down, color: Colors.white70),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTracksTile(
+    BuildContext context,
+    PlayerViewModel viewModel,
+    PlayerState state,
+  ) {
+    return ListTile(
+      leading: TextButton(
+        onPressed: null,
+        style: TextButton.styleFrom(
+          minimumSize: Size.zero,
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          foregroundColor: Colors.white70,
+        ),
+        child: const Text(
+          '轨道',
+          style: TextStyle(fontSize: 13),
+        ),
+      ),
+      title: const Text(
+        'Track',
+        style: TextStyle(color: Colors.white),
+      ),
+      subtitle: Text(
+        _currentTrackLabel(state),
+        style: TextStyle(color: Colors.white.withValues(alpha: 0.6)),
+      ),
+      trailing: PopupMenuButton<int>(
+        color: Colors.grey.shade900,
+        onSelected: (value) {
+          if (value >= 20000) {
+            viewModel.selectSubtitleTrack(value - 20000);
+          } else if (value >= 10000) {
+            viewModel.selectAudioTrack(value - 10000);
+          } else {
+            viewModel.selectVideoTrack(value);
+          }
+        },
+        itemBuilder: (_) {
+          final items = <PopupMenuEntry<int>>[];
+
+          // Video tracks
+          for (final entry in state.videoTracks.asMap().entries) {
+            final isSelected = entry.key == state.selectedVideoIndex;
+            items.add(
+              PopupMenuItem(
+                value: entry.key,
+                child: Text(
+                  '#${entry.value.index} ${entry.value.displayTitle ?? 'Video ${entry.key + 1}'}',
+                  style: TextStyle(
+                    color: isSelected ? Colors.blue : Colors.white,
+                    fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                  ),
+                ),
+              ),
+            );
+          }
+
+          // Divider between video and audio
+          if (state.videoTracks.isNotEmpty && state.audioTracks.isNotEmpty) {
+            items.add(const PopupMenuDivider());
+          }
+
+          // Audio tracks
+          for (final entry in state.audioTracks.asMap().entries) {
+            final isSelected = entry.key == state.selectedAudioIndex;
+            items.add(
+              PopupMenuItem(
+                value: entry.key + 10000,
+                child: Text(
+                  '#${entry.value.index} ${entry.value.displayTitle ?? 'Audio ${entry.key + 1}'}',
+                  style: TextStyle(
+                    color: isSelected ? Colors.blue : Colors.white,
+                    fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                  ),
+                ),
+              ),
+            );
+          }
+
+          // Divider between audio and subtitle
+          if (state.audioTracks.isNotEmpty && state.subtitleTracks.isNotEmpty) {
+            items.add(const PopupMenuDivider());
+          }
+
+          // Subtitle tracks
+          for (final entry in state.subtitleTracks.asMap().entries) {
+            final isSelected = entry.key == state.selectedSubtitleIndex;
+            items.add(
+              PopupMenuItem(
+                value: entry.key + 20000,
+                child: Text(
+                  '#${entry.value.index} ${entry.value.displayTitle ?? 'Subtitle ${entry.key + 1}'}',
+                  style: TextStyle(
+                    color: isSelected ? Colors.blue : Colors.white,
+                    fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                  ),
+                ),
+              ),
+            );
+          }
+
+          return items;
+        },
+        child: const Icon(Icons.arrow_drop_down, color: Colors.white70),
+      ),
+    );
+  }
+
+  String _currentTrackLabel(PlayerState state) {
+    final parts = <String>[];
+    if (state.videoTracks.isNotEmpty) {
+      final idx = state.selectedVideoIndex;
+      if (idx >= 0 && idx < state.videoTracks.length) {
+        parts.add('#${state.videoTracks[idx].index}');
+      } else {
+        parts.add('#${state.videoTracks.first.index}');
+      }
+    }
+    if (state.audioTracks.isNotEmpty) {
+      final idx = state.selectedAudioIndex;
+      if (idx >= 0 && idx < state.audioTracks.length) {
+        parts.add('#${state.audioTracks[idx].index}');
+      } else {
+        parts.add('#${state.audioTracks.first.index}');
+      }
+    }
+    if (state.subtitleTracks.isNotEmpty) {
+      final idx = state.selectedSubtitleIndex;
+      if (idx >= 0 && idx < state.subtitleTracks.length) {
+        parts.add('#${state.subtitleTracks[idx].index}');
+      } else {
+        parts.add('Off');
+      }
+    }
+    return parts.join(' / ');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Top bar
+// ---------------------------------------------------------------------------
+class _TopBar extends StatelessWidget {
+  final String title;
+  final VoidCallback onBack;
+  final VoidCallback onHome;
+  final VoidCallback onSettings;
+
+  const _TopBar({
+    required this.title,
+    required this.onBack,
+    required this.onHome,
+    required this.onSettings,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final screenLayout = MediaQuery.of(context);
+    final isSmall = screenLayout.size.width < 600;
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 8.0),
+      child: Row(
+        children: [
+          Semantics(
+            label: 'Back',
+            button: true,
+            child: Tooltip(
+              message: 'Back',
+              child: IconButton(
+                onPressed: onBack,
+                icon: const Icon(Icons.arrow_back),
+                color: Colors.white,
+                iconSize: isSmall ? 24 : 28,
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              title,
+              style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                    color: Colors.white,
+                    fontWeight: FontWeight.w600,
+                    fontSize: isSmall ? 16 : 18,
+                  ),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          Semantics(
+            label: 'Home',
+            button: true,
+            child: Tooltip(
+              message: 'Home',
+              child: IconButton(
+                onPressed: onHome,
+                icon: const Icon(Icons.home),
+                color: Colors.white,
+                iconSize: isSmall ? 24 : 28,
+              ),
+            ),
+          ),
+          Semantics(
+            label: 'Settings',
+            button: true,
+            child: Tooltip(
+              message: 'Settings',
+              child: IconButton(
+                onPressed: onSettings,
+                icon: const Icon(Icons.settings),
+                color: Colors.white,
+                iconSize: isSmall ? 24 : 28,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Center seek controls
+// ---------------------------------------------------------------------------
+class _CenterSeekControls extends StatelessWidget {
+  final VoidCallback onSeekBackward;
+  final VoidCallback onSeekForward;
+
+  const _CenterSeekControls({
+    required this.onSeekBackward,
+    required this.onSeekForward,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final screenLayout = MediaQuery.of(context);
+    final isSmall = screenLayout.size.width < 600;
+    final buttonSize = isSmall ? 56.0 : 72.0;
+    final iconSize = isSmall ? 32.0 : 40.0;
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 24),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          // Double-tap left area: seek backward.
+          Semantics(
+            label: 'Rewind 10 seconds',
+            button: true,
+            child: GestureDetector(
+              onTap: onSeekBackward,
+              child: Container(
+                width: buttonSize,
+                height: buttonSize,
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.3),
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(
+                  Icons.replay_10,
+                  color: Colors.white,
+                  size: iconSize,
+                ),
+              ),
+            ),
+          ),
+          // Double-tap right area: seek forward.
+          Semantics(
+            label: 'Forward 10 seconds',
+            button: true,
+            child: GestureDetector(
+              onTap: onSeekForward,
+              child: Container(
+                width: buttonSize,
+                height: buttonSize,
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.3),
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(
+                  Icons.forward_10,
+                  color: Colors.white,
+                  size: iconSize,
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Bottom bar
+// ---------------------------------------------------------------------------
+class _BottomBar extends StatelessWidget {
+  final PlayerState state;
+  final PlayerViewModel viewModel;
+  final ColorScheme colorScheme;
+
+  const _BottomBar({
+    required this.state,
+    required this.viewModel,
+    required this.colorScheme,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final screenLayout = MediaQuery.of(context);
+    final isSmall = screenLayout.size.width < 600;
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        // Progress slider.
+        ProgressSlider(
+          position: state.position,
+          duration: state.duration,
+          onSeek: viewModel.seek,
+        ),
+        const SizedBox(height: 4),
+        // Transport controls row.
+        Padding(
+          padding: EdgeInsets.symmetric(
+            horizontal: isSmall ? 8.0 : 16.0,
+            vertical: 4.0,
+          ),
+          child: Row(
+            children: [
+              // Play / Pause.
+              Semantics(
+                label: state.isPlaying ? 'Pause' : 'Play',
+                button: true,
+                child: Tooltip(
+                  message: state.isPlaying ? 'Pause' : 'Play',
+                  child: IconButton(
+                    onPressed: viewModel.playPause,
+                    icon: AnimatedSwitcher(
+                      duration: const Duration(milliseconds: 200),
+                      transitionBuilder: (child, animation) {
+                        return ScaleTransition(
+                          scale: animation,
+                          child: child,
+                        );
+                      },
+                      child: Icon(
+                        state.isPlaying ? Icons.pause : Icons.play_arrow,
+                        key: ValueKey<bool>(state.isPlaying),
+                        color: Colors.white,
+                        size: isSmall ? 32 : 36,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              // Spacer.
+              const SizedBox(width: 8),
+              // Expanded row for right-aligned controls.
+              Expanded(
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    // Speed button.
+                    Semantics(
+                      label: 'Playback speed ${state.speed}x',
+                      button: true,
+                      child: Tooltip(
+                        message: 'Speed: ${state.speed}x',
+                        child: TextButton(
+                          onPressed: () => _showSpeedPicker(context, viewModel, state),
+                          style: TextButton.styleFrom(
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(horizontal: 8),
+                          ),
+                          child: Text(
+                            '${state.speed}x',
+                            style: const TextStyle(fontSize: 13),
+                          ),
+                        ),
+                      ),
+                    ),
+                    // Fullscreen toggle (placeholder).
+                    Semantics(
+                      label: 'Toggle fullscreen',
+                      button: true,
+                      child: Tooltip(
+                        message: 'Toggle fullscreen',
+                        child: IconButton(
+                          onPressed: () {
+                            // Fullscreen toggle handled by the parent page.
+                          },
+                          icon: const Icon(Icons.fullscreen),
+                          color: Colors.white,
+                          iconSize: isSmall ? 24 : 28,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+        // Buffering indicator.
+        if (state.isBuffering)
+          const Padding(
+            padding: EdgeInsets.only(bottom: 8.0),
+            child: SizedBox(
+              width: 16,
+              height: 16,
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                valueColor: AlwaysStoppedAnimation<Color>(Colors.white70),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  void _showSpeedPicker(
+    BuildContext context,
+    PlayerViewModel viewModel,
+    PlayerState state,
+  ) {
+    final speeds = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: Colors.black.withValues(alpha: 0.9),
+      barrierColor: Colors.transparent,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (ctx) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 40,
+                height: 4,
+                margin: const EdgeInsets.symmetric(vertical: 12),
+                decoration: BoxDecoration(
+                  color: Colors.white.withValues(alpha: 0.3),
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              ...speeds.map((s) {
+                final isSelected = s == state.speed;
+                return ListTile(
+                  leading: Icon(
+                    Icons.speed,
+                    color: isSelected
+                        ? Theme.of(context).colorScheme.primary
+                        : Colors.white70,
+                  ),
+                  title: Text(
+                    '${s}x',
+                    style: TextStyle(
+                      color: isSelected
+                          ? Theme.of(context).colorScheme.primary
+                          : Colors.white,
+                      fontWeight:
+                          isSelected ? FontWeight.bold : FontWeight.normal,
+                    ),
+                  ),
+                  trailing: isSelected
+                      ? Icon(
+                          Icons.check,
+                          color: Theme.of(context).colorScheme.primary,
+                        )
+                      : null,
+                  onTap: () {
+                    viewModel.setSpeed(s);
+                    Navigator.of(ctx).pop();
+                  },
+                );
+              }),
+              const SizedBox(height: 16),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+extension on Duration {
+  Duration clamp(Duration min, Duration max) {
+    if (this < min) return min;
+    if (this > max) return max;
+    return this;
+  }
+}

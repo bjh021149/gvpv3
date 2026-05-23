@@ -1,0 +1,376 @@
+/// 认证仓库实现
+///
+/// 使用 [FlutterSecureStorage] 安全存储敏感信息（Token、密码等），
+/// 使用 [SharedPreferences] 存储非敏感的用户配置信息。
+///
+/// 存储策略:
+/// - SecureStorage: `emby_access_token`, `emby_server_url`
+/// - SharedPreferences: `emby_user_id`, `emby_username`
+library;
+
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:dio/dio.dart';
+import 'package:dio/io.dart';
+import 'package:emby_client/core/models/authentication_result.dart';
+import 'package:emby_client/core/models/user_dto.dart';
+import 'package:emby_client/core/api/emby_api_service.dart';
+import 'package:emby_client/services/repositories/auth_repository.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:uuid/uuid.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+/// AuthRepository 的 Riverpod Provider
+///
+/// 提供单例的 [AuthRepositoryImpl] 实例，供全应用使用。
+///
+/// 使用示例:
+/// ```dart
+/// final authRepo = ref.watch(authRepositoryProvider);
+/// final isAuth = await authRepo.isAuthenticated();
+/// ```
+final authRepositoryProvider = Provider<AuthRepository>((ref) {
+  return AuthRepositoryImpl();
+});
+
+/// [AuthRepository] 的具体实现类
+///
+/// 管理所有认证状态的持久化，使用分层存储策略确保安全性。
+/// 通过 [EmbyApiService] 执行实际的 API 调用。
+class AuthRepositoryImpl implements AuthRepository {
+  /// 安全存储实例，用于保存敏感数据
+  static const _secureStorage = FlutterSecureStorage(
+    aOptions: AndroidOptions(
+      encryptedSharedPreferences: true,
+    ),
+    iOptions: IOSOptions(
+      accountName: 'emby_auth',
+      accessibility: KeychainAccessibility.first_unlock_this_device,
+    ),
+  );
+
+  // SecureStorage Keys
+  static const _keyAccessToken = 'emby_access_token';
+  static const _keyServerUrl = 'emby_server_url';
+  static const _keyPassword = 'emby_password';
+
+  // SharedPreferences Keys
+  static const _keyUserId = 'emby_user_id';
+  static const _keyUsername = 'emby_username';
+
+  /// SharedPreferences 实例（延迟初始化）
+  SharedPreferences? _prefs;
+
+  /// 缓存的 API 服务实例
+  EmbyApiService? _apiService;
+
+  /// 获取 SharedPreferences 实例
+  Future<SharedPreferences> get _sharedPrefs async {
+    _prefs ??= await SharedPreferences.getInstance();
+    return _prefs!;
+  }
+
+  @override
+  Future<AuthenticationResult> authenticate(
+    String serverUrl,
+    String username,
+    String password,
+  ) async {
+    // 读取/生成设备信息用于 Authorization header
+    final prefs = await _sharedPrefs;
+    final deviceName = prefs.getString('device_name');
+    var deviceId = prefs.getString('device_id');
+    final effectiveDeviceName =
+        (deviceName != null && deviceName.isNotEmpty) ? deviceName : 'Flutter Device';
+
+    // 如果没有持久化的 deviceId，生成一个新的 UUID 并保存
+    if (deviceId == null || deviceId.isEmpty) {
+      deviceId = const Uuid().v4();
+      await prefs.setString('device_id', deviceId);
+    }
+    final effectiveDeviceId = deviceId;
+
+    final authHeader =
+        'MediaBrowser Client="EmbyFlutter", Device="$effectiveDeviceName", '
+        'DeviceId="$effectiveDeviceId", Version="1.0.0"';
+
+    final body = 'Username=${Uri.encodeComponent(username)}'
+        '&Pw=${Uri.encodeComponent(password)}';
+
+    debugPrint('[AuthRepositoryImpl] POST $serverUrl/Users/AuthenticateByName');
+    debugPrint('[AuthRepositoryImpl] Authorization: $authHeader');
+    debugPrint('[AuthRepositoryImpl] Body: $body');
+
+    final client = HttpClient();
+    try {
+      final request = await client.postUrl(
+        Uri.parse('$serverUrl/Users/AuthenticateByName'),
+      );
+      request.headers.contentType = ContentType('application', 'x-www-form-urlencoded');
+      request.headers.add('Authorization', authHeader);
+      request.headers.add('Accept', 'application/json');
+      request.write(body);
+
+      final response = await request.close();
+      final responseBody = await response.transform(utf8.decoder).join();
+
+      debugPrint('[AuthRepositoryImpl] Response status: ${response.statusCode}');
+      debugPrint('[AuthRepositoryImpl] Response body: $responseBody');
+
+      if (response.statusCode != 200) {
+        throw Exception(
+          'Authentication failed: HTTP ${response.statusCode}, body: $responseBody',
+        );
+      }
+
+      final json = jsonDecode(responseBody) as Map<String, dynamic>;
+      final result = AuthenticationResult.fromJson(json);
+
+      // 持久化认证信息
+      await _persistAuthData(result, serverUrl, username, password);
+
+      // 缓存 API 服务供后续使用
+      _apiService = EmbyApiService(
+        dio: _createDio(serverUrl, result.accessToken!, effectiveDeviceId),
+        userId: result.user?.id,
+      );
+
+      return result;
+    } catch (e) {
+      debugPrint('[AuthRepositoryImpl] Exception: $e');
+      await logout();
+      rethrow;
+    } finally {
+      client.close();
+    }
+  }
+
+  @override
+  Future<void> logout() async {
+    // 清除安全存储
+    await _secureStorage.delete(key: _keyAccessToken);
+    await _secureStorage.delete(key: _keyServerUrl);
+    await _secureStorage.delete(key: _keyPassword);
+
+    // 清除 SharedPreferences
+    final prefs = await _sharedPrefs;
+    await prefs.remove(_keyUserId);
+    await prefs.remove(_keyUsername);
+
+    // 清除缓存
+    _apiService = null;
+  }
+
+  @override
+  Future<bool> isAuthenticated() async {
+    try {
+      final token = await _secureStorage.read(key: _keyAccessToken);
+      final serverUrl = await _secureStorage.read(key: _keyServerUrl);
+
+      return token != null &&
+          token.isNotEmpty &&
+          serverUrl != null &&
+          serverUrl.isNotEmpty;
+    } catch (e) {
+      // 读取失败视为未认证
+      return false;
+    }
+  }
+
+  @override
+  String? getCurrentUserId() {
+    // 同步读取已缓存的 prefs
+    if (_prefs == null) return null;
+    return _prefs!.getString(_keyUserId);
+  }
+
+  @override
+  String? getServerUrl() {
+    // SecureStorage 只支持异步，但这里提供一个同步备选
+    // 实际使用时建议调用方使用异步版本
+    if (_prefs == null) return null;
+
+    // 尝试从 prefs 获取缓存的服务器地址（登出时会清除）
+    return _prefs!.getString(_keyServerUrl);
+  }
+
+  @override
+  Future<void> setServerUrl(String serverUrl) async {
+    await _secureStorage.write(key: _keyServerUrl, value: serverUrl);
+    final prefs = await _sharedPrefs;
+    await prefs.setString(_keyServerUrl, serverUrl);
+  }
+
+  /// 异步获取服务器地址（推荐）
+  ///
+  /// 从安全存储中读取服务器地址，比同步版本更可靠。
+  Future<String?> getServerUrlAsync() async {
+    return _secureStorage.read(key: _keyServerUrl);
+  }
+
+  /// 持久化认证数据到存储
+  ///
+  /// 将认证结果分别写入安全存储和 SharedPreferences。
+  Future<void> _persistAuthData(
+    AuthenticationResult result,
+    String serverUrl,
+    String username,
+    String password,
+  ) async {
+    // 写入安全存储
+    await _secureStorage.write(
+      key: _keyAccessToken,
+      value: result.accessToken,
+    );
+    await _secureStorage.write(
+      key: _keyServerUrl,
+      value: serverUrl,
+    );
+    await _secureStorage.write(
+      key: _keyPassword,
+      value: password,
+    );
+
+    // 写入 SharedPreferences
+    final prefs = await _sharedPrefs;
+    await prefs.setString(_keyUserId, result.user!.id!);
+    await prefs.setString(_keyUsername, username);
+  }
+
+  @override
+  Future<String?> getAccessToken() async {
+    return _secureStorage.read(key: _keyAccessToken);
+  }
+
+  @override
+  String? getUsername() {
+    if (_prefs == null) return null;
+    return _prefs!.getString(_keyUsername);
+  }
+
+  @override
+  bool isAuthenticatedSync() {
+    // 同步检查：如果 SharedPreferences 已初始化则直接读取
+    // 否则返回 false（未初始化时尚未完成认证流程）
+    if (_prefs == null) return false;
+
+    final userId = _prefs!.getString(_keyUserId);
+    final username = _prefs!.getString(_keyUsername);
+
+    return userId != null &&
+        userId.isNotEmpty &&
+        username != null &&
+        username.isNotEmpty;
+  }
+
+  @override
+  Future<bool> testConnection(String serverUrl) async {
+    try {
+      final dio = Dio(BaseOptions(
+        baseUrl: serverUrl,
+        connectTimeout: const Duration(seconds: 5),
+        receiveTimeout: const Duration(seconds: 5),
+      ));
+      final response = await dio.get('/System/Info/Public');
+      return response.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// 创建带认证的 Dio 实例
+  Dio _createDio(String baseUrl, String accessToken, String deviceId) {
+    final dio = Dio(BaseOptions(
+      baseUrl: baseUrl,
+      connectTimeout: const Duration(seconds: 30),
+      receiveTimeout: const Duration(seconds: 30),
+      headers: {
+        'Accept': 'application/json',
+        'X-Emby-Token': accessToken,
+      },
+    ));
+
+    dio.interceptors.add(InterceptorsWrapper(
+      onRequest: (options, handler) {
+        options.headers['Authorization'] =
+            'MediaBrowser Client="EmbyFlutter", DeviceId="$deviceId", Version="1.0.0"';
+        debugPrint(
+          '[EmbyApi] REQUEST ${options.method} ${options.path} '
+          'headers=${options.headers} query=${options.queryParameters}',
+        );
+        if (options.data != null) {
+          debugPrint('[EmbyApi] REQUEST BODY: ${options.data}');
+        }
+        handler.next(options);
+      },
+      onResponse: (response, handler) {
+        debugPrint(
+          '[EmbyApi] RESPONSE ${response.statusCode} ${response.requestOptions.path}',
+        );
+        if (response.data != null) {
+          final body = response.data.toString();
+          debugPrint(
+            '[EmbyApi] RESPONSE BODY: ${body.length > 500 ? body.substring(0, 500) + '...' : body}',
+          );
+        }
+        handler.next(response);
+      },
+      onError: (e, handler) {
+        debugPrint(
+          '[EmbyApi] ERROR ${e.response?.statusCode} ${e.requestOptions.path} => ${e.message}',
+        );
+        handler.next(e);
+      },
+    ));
+
+    // 允许自签名证书
+    if (!kIsWeb) {
+      dio.httpClientAdapter = IOHttpClientAdapter(
+        createHttpClient: () {
+          final client = HttpClient();
+          client.badCertificateCallback =
+              (X509Certificate cert, String host, int port) => true;
+          return client;
+        },
+      );
+    }
+
+    return dio;
+  }
+
+  @override
+  Future<void> clearCache() async {
+    // 清除图片缓存（如有需要可扩展）
+    // 当前实现为空，等待缓存策略完善
+  }
+
+  @override
+  Future<bool> refreshAuthentication() async {
+    try {
+      final serverUrl = await _secureStorage.read(key: _keyServerUrl);
+      final username = await _secureStorage.read(key: _keyUsername);
+      final password = await _secureStorage.read(key: _keyPassword);
+
+      if (serverUrl == null ||
+          serverUrl.isEmpty ||
+          username == null ||
+          username.isEmpty ||
+          password == null ||
+          password.isEmpty) {
+        debugPrint('[AuthRepository] Refresh failed: missing stored credentials');
+        return false;
+      }
+
+      debugPrint('[AuthRepository] Attempting token refresh for $username');
+      await authenticate(serverUrl, username, password);
+      debugPrint('[AuthRepository] Token refresh succeeded');
+      return true;
+    } catch (e) {
+      debugPrint('[AuthRepository] Token refresh failed: $e');
+      return false;
+    }
+  }
+}

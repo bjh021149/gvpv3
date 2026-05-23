@@ -1,0 +1,20 @@
+# build.yaml
+# Configures code-generation builders for this project.
+#
+# Emby API returns PascalCase JSON keys (e.g. "Id", "Name", "AccessToken").
+# By default json_serializable uses camelCase, which mismatches the API.
+# This config sets the default field rename strategy to PascalCase for ALL
+# json_serializable outputs in the project.
+#
+# Note: Freezed does NOT copy @JsonSerializable arguments from the source
+# class to the generated _$ClassImpl, so class-level @JsonSerializable()
+# annotations have no effect. build.yaml is the only reliable way to
+# configure json_serializable when using Freezed 3.x.
+targets:
+  $default:
+    builders:
+      json_serializable:
+        options:
+          # Map camelCase Dart fields to PascalCase JSON keys.
+          # e.g. id -> Id, accessToken -> AccessToken, mediaSources -> MediaSources
+          field_rename: pascal
